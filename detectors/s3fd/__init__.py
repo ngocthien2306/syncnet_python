@@ -28,7 +28,7 @@ class S3FD():
 
         w, h = image.shape[1], image.shape[0]
 
-        bboxes = np.empty(shape=(0, 5))
+        bbox_list = []
 
         with torch.no_grad():
             for s in scales:
@@ -51,11 +51,11 @@ class S3FD():
                     while detections[0, i, j, 0] > conf_th:
                         score = detections[0, i, j, 0]
                         pt = (detections[0, i, j, 1:] * scale).cpu().numpy()
-                        bbox = (pt[0], pt[1], pt[2], pt[3], score)
-                        bboxes = np.vstack((bboxes, bbox))
+                        bbox_list.append((pt[0], pt[1], pt[2], pt[3], float(score)))
                         j += 1
 
-            keep = nms_(bboxes, 0.1)
-            bboxes = bboxes[keep]
+        bboxes = np.array(bbox_list, dtype=np.float32) if bbox_list else np.empty(shape=(0, 5))
+        keep = nms_(bboxes, 0.1)
+        bboxes = bboxes[keep]
 
         return bboxes

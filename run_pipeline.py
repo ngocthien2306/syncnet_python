@@ -7,8 +7,6 @@ from shutil import rmtree
 import scenedetect
 from scenedetect.video_manager import VideoManager
 from scenedetect.scene_manager import SceneManager
-from scenedetect.frame_timecode import FrameTimecode
-from scenedetect.stats_manager import StatsManager
 from scenedetect.detectors import ContentDetector
 
 from scipy.interpolate import interp1d
@@ -222,19 +220,12 @@ def inference_video(opt):
 def scene_detect(opt):
 
   video_manager = VideoManager([os.path.join(opt.avi_dir,opt.reference,'video.avi')])
-  stats_manager = StatsManager()
-  scene_manager = SceneManager(stats_manager)
-  # Add ContentDetector algorithm (constructor takes detector options like threshold).
+  scene_manager = SceneManager()
   scene_manager.add_detector(ContentDetector())
-  base_timecode = video_manager.get_base_timecode()
-
   video_manager.set_downscale_factor()
-
   video_manager.start()
-
-  scene_manager.detect_scenes(frame_source=video_manager)
-
-  scene_list = scene_manager.get_scene_list(base_timecode)
+  scene_manager.detect_scenes(frame_source=video_manager, frame_skip=3)
+  scene_list = scene_manager.get_scene_list()
 
   savepath = os.path.join(opt.work_dir,opt.reference,'scene.pckl')
 

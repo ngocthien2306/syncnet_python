@@ -30,6 +30,7 @@ class S3FDNet(nn.Module):
     def __init__(self, device='cuda'):
         super(S3FDNet, self).__init__()
         self.device = device
+        self._prior_cache = {}  # (size, features_maps key) -> priors tensor
 
         self.vgg = nn.ModuleList([
             nn.Conv2d(3, 64, 3, 1, padding=1),
@@ -161,9 +162,11 @@ class S3FDNet(nn.Module):
         loc = torch.cat([o.view(o.size(0), -1) for o in loc], 1)
         conf = torch.cat([o.view(o.size(0), -1) for o in conf], 1)
 
-        with torch.no_grad():
-            self.priorbox = PriorBox(size, features_maps)
-            self.priors = self.priorbox.forward()
+        cache_key = (size, tuple(tuple(f) for f in features_maps))
+        if cache_key not in self._prior_cache:
+            with torch.no_grad():
+                self._prior_cache[cache_key] = PriorBox(size, features_maps).forward()
+        self.priors = self._prior_cache[cache_key]
 
         output = self.detect.forward(
             loc.view(loc.size(0), -1, 4),
