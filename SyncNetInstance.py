@@ -180,3 +180,5 @@ class SyncNetInstance(torch.nn.Module):
         for name, param in loaded_state.items():
 
             self_state[name].copy_(param);
+
+        self.__S__.eval()  # set eval mode once after loading — BatchNorm requires this

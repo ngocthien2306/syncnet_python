@@ -36,6 +36,14 @@ warnings.filterwarnings("ignore")
 # ==================== CONFIG ====================
 BASE_CODE_DIR  = Path(".")
 
+# ==================== PARALLEL TUNING ====================
+_SLOTS_PER_GPU = 4                                        # scenes sharing each GPU
+_N_GPUS        = torch.cuda.device_count() if torch.cuda.is_available() else 1
+_TOTAL_WORKERS = max(_N_GPUS, 1) * _SLOTS_PER_GPU        # e.g. 8 × 4 = 32
+_CPU_COUNT     = os.cpu_count() or 8
+# Per-scene sub-task workers (crop, head pose, syncnet prep) — IO-bound, can oversubscribe
+_CPU_WORKERS_PER_SCENE = max(4, min(8, _CPU_COUNT // max(_N_GPUS, 1)))
+
 CONFIG = {
     # --- THƯ MỤC ---
     "input_dir":            "./input_videos",
@@ -81,8 +89,7 @@ CONFIG = {
     "max_audio_duration":   25.0,
 
     # --- PARALLEL ---
-    # Auto-scale to number of GPUs × slots per GPU
-    "max_workers":          max(torch.cuda.device_count(), 1) * _SLOTS_PER_GPU if torch.cuda.is_available() else 1,
+    "max_workers":          _TOTAL_WORKERS,
 }
 
 SUPPORTED_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv"}
@@ -124,11 +131,7 @@ def _build_gpu_pool(slots_per_gpu: int = 1) -> _queue_mod.Queue:
         pool.put("cpu")
     return pool
 
-_SLOTS_PER_GPU = 4   # scenes sharing each GPU concurrently; tune based on GPU memory
 _gpu_pool = _build_gpu_pool(slots_per_gpu=_SLOTS_PER_GPU)
-
-# Legacy alias kept for head-pose serialization (CPU-bound SCRFD ONNX session)
-_headpose_lock = threading.Lock()
 
 # ==================== FILE LOCK (multi-terminal safe) ====================
 class FileLock:
@@ -193,9 +196,11 @@ def mark_error(video_name: str, error: str):
         save_done_log(done)
 
 
-_folder_lock = threading.Lock()
+_FOLDER_LOCK_FILE = Path(CONFIG["output_dir"]) / ".folder.lock"
+
 def get_next_result_folder(output_base: Path) -> Path:
-    with _folder_lock:
+    # FileLock for cross-process safety (multi-terminal)
+    with FileLock(_FOLDER_LOCK_FILE):
         existing = sorted(output_base.glob("result*"))
         max_num = 0
         for folder in existing:
@@ -364,7 +369,7 @@ def filter_by_head_pose(opt) -> dict:
 
     # Check all crop files in parallel: SCRFD (ONNX) + VideoCapture are CPU/IO-bound
     # and thread-safe; GPU pose inference serializes automatically on the same device.
-    hp_workers = min(total, 4)
+    hp_workers = min(total, _CPU_WORKERS_PER_SCENE)
     results_map = {}
     with ThreadPoolExecutor(max_workers=hp_workers) as executor:
         futures = {executor.submit(check_head_pose_video, cp, device): cp
@@ -467,18 +472,20 @@ def crop_video(opt, track, cropfile, flist=None):
     return {"track": track, "proc_track": dets}
 
 
-def inference_video(opt):
+def inference_video(opt, batch_size: int = 16):
     logger.info(f"  inference_video [{opt.reference}]: device={opt.device}")
     DET   = _load_s3fd(opt.device)
     flist = sorted(glob.glob(os.path.join(opt.frames_dir, opt.reference, "*.jpg")))
     logger.info(f"  inference_video [{opt.reference}]: {len(flist)} frames")
-    dets  = []
-    for fidx, fname in enumerate(flist):
-        image    = cv2.imread(fname)
-        image_np = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        bboxes   = DET.detect_faces(image_np, conf_th=0.9, scales=[opt.facedet_scale])
-        dets.append([{"frame": fidx, "bbox": (bbox[:-1]).tolist(), "conf": bbox[-1]}
-                      for bbox in bboxes])
+    dets  = [[] for _ in range(len(flist))]
+    for batch_start in range(0, len(flist), batch_size):
+        batch_end    = min(batch_start + batch_size, len(flist))
+        batch_frames = [cv2.cvtColor(cv2.imread(flist[i]), cv2.COLOR_BGR2RGB)
+                        for i in range(batch_start, batch_end)]
+        batch_bboxes = DET.detect_faces_batch(batch_frames, conf_th=0.9, scales=[opt.facedet_scale])
+        for fidx, bboxes in zip(range(batch_start, batch_end), batch_bboxes):
+            dets[fidx] = [{"frame": fidx, "bbox": bbox[:-1].tolist(), "conf": float(bbox[-1])}
+                          for bbox in bboxes]
     savepath = os.path.join(opt.work_dir, opt.reference, "faces.pckl")
     with open(savepath, "wb") as f:
         pickle.dump(dets, f)
@@ -536,24 +543,16 @@ def run_pipeline(opt):
         f_frames.result()
         f_audio.result()
 
-    # Run face detection (GPU) and scene detection (CPU) in parallel — independent inputs
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        f_faces = executor.submit(inference_video, opt)
-        f_scene = executor.submit(scene_detect, opt)
-        faces = f_faces.result()
-        scene = f_scene.result()
-
-    alltracks = []
-    for shot in scene:
-        if shot[1].frame_num - shot[0].frame_num >= opt.min_track:
-            alltracks.extend(track_shot(opt, faces[shot[0].frame_num:shot[1].frame_num]))
+    # Face detection — clip is already pre-split by run_scenedetect, no need for inner scene_detect
+    faces = inference_video(opt)
+    alltracks = track_shot(opt, faces)
 
     # Compute flist once — all tracks in this scene share the same frames dir
     flist = sorted(glob.glob(os.path.join(opt.frames_dir, opt.reference, "*.jpg")))
 
     # Step 3: crop all face tracks in parallel (CPU/IO-bound, no GPU)
     vidtracks = [None] * len(alltracks)
-    crop_workers = min(len(alltracks), 4) if alltracks else 1
+    crop_workers = min(len(alltracks), _CPU_WORKERS_PER_SCENE) if alltracks else 1
     with ThreadPoolExecutor(max_workers=crop_workers) as executor:
         futures = {
             executor.submit(
@@ -582,7 +581,7 @@ def run_syncnet(opt):
         return
 
     # Phase 1 — CPU: read video/audio + MFCC in parallel (no GPU needed)
-    cpu_workers = max(4, len(flist))
+    cpu_workers = min(len(flist), max(_CPU_WORKERS_PER_SCENE, 16))
     prepared = [None] * len(flist)
     with ThreadPoolExecutor(max_workers=cpu_workers) as executor:
         futures = {executor.submit(s.prepare_data, fname): i

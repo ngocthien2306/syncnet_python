@@ -129,9 +129,12 @@ def nms(boxes, scores, overlap=0.5, top_k=200):
 class Detect(object):
 
     def __init__(self, num_classes=2,
-                    top_k=750, nms_thresh=0.3, conf_thresh=0.05,
+                    top_k=750, nms_thresh=0.3, conf_thresh=0.5,
                     variance=[0.1, 0.2], nms_top_k=5000):
-        
+        # conf_thresh raised from 0.05 → 0.5: det_faces applies conf_th=0.9 anyway,
+        # so boxes below 0.5 would be discarded post-NMS. Raising this reduces the
+        # number of boxes fed into the Python NMS loop by 10-100×, avoiding thousands
+        # of forced CPU-GPU syncs on crowded scenes.
         self.num_classes = num_classes
         self.top_k = top_k
         self.nms_thresh = nms_thresh
@@ -151,16 +154,23 @@ class Detect(object):
         decoded_boxes = decode(loc_data.view(-1, 4), batch_priors, self.variance)
         decoded_boxes = decoded_boxes.view(num, num_priors, 4)
 
+        # Move to CPU once before the Python NMS loop.
+        # The nms() while-loop does boolean indexing (idx[mask]) on every iteration
+        # which forces a CPU-GPU sync each time — catastrophic for crowded scenes.
+        # One bulk GPU→CPU transfer here is far cheaper than N×sync inside the loop.
+        decoded_boxes_cpu = decoded_boxes.cpu()
+        conf_preds_cpu    = conf_preds.cpu()
+
         output = torch.zeros(num, self.num_classes, self.top_k, 5)
 
         for i in range(num):
-            boxes = decoded_boxes[i].clone()
-            conf_scores = conf_preds[i].clone()
+            boxes       = decoded_boxes_cpu[i].clone()
+            conf_scores = conf_preds_cpu[i].clone()
 
             for cl in range(1, self.num_classes):
                 c_mask = conf_scores[cl].gt(self.conf_thresh)
                 scores = conf_scores[cl][c_mask]
-                
+
                 if scores.dim() == 0:
                     continue
                 l_mask = c_mask.unsqueeze(1).expand_as(boxes)
